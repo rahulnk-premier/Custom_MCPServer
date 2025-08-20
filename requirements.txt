@@ -1,0 +1,11 @@
+fastmcp
+python-dotenv
+httpx
+chromadb
+sentence-transformers
+certifi
+urllib3
+torch
+transformers
+Pillow
+beautifulsoup4
