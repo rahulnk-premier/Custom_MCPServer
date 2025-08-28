@@ -1,6 +1,6 @@
 # Model folders (large offline models)
-bge-model-offline/
-blip-model-offline/
+#bge-model-offline/
+#blip-model-offline/
 
 # Python
 __pycache__/

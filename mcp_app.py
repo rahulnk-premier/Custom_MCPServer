@@ -158,7 +158,7 @@ async def find_relevant_repositories(description: str, n_results: int = 3) -> Di
             verify=CERTIFICATE_PATH 
         )
 
-        encoder = SentenceTransformer(EMBEDDING_MODEL_REPOS)
+        encoder = SentenceTransformer(EMBEDDING_MODEL_PATH)
 
         # 2. Create embedding for the incident description
         query_vector = encoder.encode(description).tolist()

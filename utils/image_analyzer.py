@@ -50,9 +50,9 @@ MODEL: Optional[BlipForConditionalGeneration] = None
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 try:
-    #logger.info(f"Loading vision model from local path '{MODEL_ID}' onto device '{DEVICE}'...")
-    PROCESSOR = BlipProcessor.from_pretrained(MODEL_ID)
-    MODEL = BlipForConditionalGeneration.from_pretrained(MODEL_ID).to(DEVICE)
+    logger.info(f"Loading vision model from local path '{MODEL_PATH}' onto device '{DEVICE}'...")
+    PROCESSOR = BlipProcessor.from_pretrained(MODEL_PATH)
+    MODEL = BlipForConditionalGeneration.from_pretrained(MODEL_PATH).to(DEVICE)
     logger.info("Vision model loaded successfully from local files.")
 
 except Exception as e:
