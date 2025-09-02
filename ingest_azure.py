@@ -1,120 +1,130 @@
-# ingest.py
 import os
 import asyncio
+import time
+import uuid
 from pathlib import Path
 from dotenv import load_dotenv
 from azure.core.credentials import AzureKeyCredential
 from azure.search.documents import SearchClient
-from sentence_transformers import SentenceTransformer
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-import uuid
-import json
-
+from azure.core.exceptions import ServiceRequestError, HttpResponseError
+from asyncio import sleep
 from utils.document_parser import parse_document
 from utils.azure_search_helpers import create_search_index
+from openai import AzureOpenAI
+from langchain.text_splitter import RecursiveCharacterTextSplitter
 
-# --- SSL Configuration for Corporate Networks ---
-# This is crucial for environments with SSL inspection.
-CERTIFICATE_PATH = r"C:\Users\Administrator\Downloads\trusted_certs.crt"
-if os.path.exists(CERTIFICATE_PATH):
-    print(f"Found certificate bundle at: {CERTIFICATE_PATH}")
-    os.environ['REQUESTS_CA_BUNDLE'] = CERTIFICATE_PATH
-else:
-    print("Warning: Custom certificate bundle not found. Using default system certificates.")
-
-
-# --- Configuration ---
 load_dotenv()
 AZURE_SEARCH_ENDPOINT = os.getenv("AZURE_SEARCH_ENDPOINT")
 AZURE_SEARCH_ADMIN_KEY = os.getenv("AZURE_SEARCH_ADMIN_KEY")
 AZURE_SEARCH_INDEX_NAME = os.getenv("AZURE_SEARCH_INDEX_NAME")
-EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL_NAME")
-DOCUMENTS_DIR = r"E:\rnakka\Downloads\Fireball_AI_Training_Docs\Fireball_AI_Training_Docs" # IMPORTANT: Set this to your documents folder
+AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
+AZURE_OPENAI_KEY = os.getenv("AZURE_OPENAI_KEY")
+AZURE_OPENAI_EMBEDDING_DEPLOYMENT = os.getenv("AZURE_OPENAI_EMBEDDING_DEPLOYMENT")
 
-# --- 1. METADATA EXTRACTION ---
-def extract_metadata_from_path(file_path: Path) -> dict:
-    """
-    Creates hierarchical metadata from the file path.
-    Example: /docs/ProjectPhoenix/auth.md -> {"project": "ProjectPhoenix", "file_name": "auth.md"}
-    """
-    parts = file_path.relative_to(DOCUMENTS_DIR).parts
-    metadata = {"source": str(file_path.name)}
-    if len(parts) > 1:
-        metadata["project"] = parts[0]
-    return metadata
+DOCUMENTS_DIR = r"E:\rnakka\Downloads\Fireball_AI_Training_Docs\Fireball_AI_Training_Docs"
+EMBEDDING_DIMENSION = 3072
 
-# --- 2. CHUNKING ---
 text_splitter = RecursiveCharacterTextSplitter(
     chunk_size=512,
     chunk_overlap=50,
     length_function=len
 )
 
-# --- 3. MAIN INGESTION LOGIC ---
+def extract_metadata_from_path(file_path: Path) -> dict:
+    parts = file_path.relative_to(DOCUMENTS_DIR).parts
+    metadata = {"source": str(file_path.name)}
+    if len(parts) > 1:
+        metadata["project"] = parts[0]
+    return metadata
+
 async def ingest_data():
-    """
-    Walks through the document directory, processes files, and uploads them to Azure AI Search.
-    """
     print("Initializing clients and models...")
-    # The AzureKeyCredential and SearchClient will automatically use the
-    # REQUESTS_CA_BUNDLE environment variable for SSL verification.
+    # Azure OpenAI client
+    openai_client = AzureOpenAI(
+        api_version="2023-05-15",
+        azure_endpoint=AZURE_OPENAI_ENDPOINT,
+        api_key=AZURE_OPENAI_KEY
+    )
+
+    create_search_index(
+        AZURE_SEARCH_ENDPOINT,
+        AZURE_SEARCH_ADMIN_KEY,
+        AZURE_SEARCH_INDEX_NAME,
+        EMBEDDING_DIMENSION
+    )
+
     credential = AzureKeyCredential(AZURE_SEARCH_ADMIN_KEY)
-    encoder = SentenceTransformer(EMBEDDING_MODEL)
-    embedding_dimensions = encoder.get_sentence_embedding_dimension()
-
-    # Create the search index if it doesn't exist
-    # This client will also respect the environment variable.
-    create_search_index(AZURE_SEARCH_ENDPOINT, AZURE_SEARCH_ADMIN_KEY, AZURE_SEARCH_INDEX_NAME, embedding_dimensions)
-
-    # Create a client to upload documents
-    search_client = SearchClient(endpoint=AZURE_SEARCH_ENDPOINT, index_name=AZURE_SEARCH_INDEX_NAME, credential=credential)
+    search_client = SearchClient(
+        endpoint=AZURE_SEARCH_ENDPOINT,
+        index_name=AZURE_SEARCH_INDEX_NAME,
+        credential=credential
+    )
 
     documents_to_upload = []
-    
     print(f"Starting ingestion from directory: {DOCUMENTS_DIR}")
     file_paths = list(Path(DOCUMENTS_DIR).rglob("*.*"))
-    
+
     for file_path in file_paths:
         if file_path.is_file():
             print(f"Processing: {file_path.name}")
-            
-            # Stage 1: Partition (Parse the document)
             text_content = parse_document(str(file_path))
             if not text_content:
                 continue
-            
-            # Stage 2: Extract Metadata
             metadata = extract_metadata_from_path(file_path)
-            
-            # Stage 3: Chunk
             chunks = text_splitter.split_text(text_content)
-            
+
             for chunk in chunks:
-                # Create a document for Azure AI Search
+                try:
+                    embedding_response = openai_client.embeddings.create(
+                        input=chunk,
+                        model=AZURE_OPENAI_EMBEDDING_DEPLOYMENT
+                    )
+                    vector_embedding = embedding_response.data[0].embedding
+                except Exception as e:
+                    print(f"Error generating embedding for a chunk: {e}")
+                    continue
+
                 document = {
                     "id": str(uuid.uuid4()),
                     "text": chunk,
-                    "vector": encoder.encode(chunk).tolist(),
+                    "vector": vector_embedding,
                     "source": metadata.get("source"),
                     "project": metadata.get("project")
                 }
                 documents_to_upload.append(document)
 
-    # Batch upload documents to Azure AI Search
     if documents_to_upload:
-        print(f"\nUploading {len(documents_to_upload)} documents to Azure AI Search...")
-        result = search_client.upload_documents(documents=documents_to_upload)
-        
-        # Check for errors
-        successful_uploads = sum(1 for r in result if r.succeeded)
-        print(f"Successfully uploaded {successful_uploads} documents.")
-        
-        for r in result:
-            if not r.succeeded:
-                print(f"Failed to upload document {r.key}: {r.error_message}")
+        print(f"\nTotal chunks to upload: {len(documents_to_upload)}")
+        await batch_upload_with_retry(search_client, documents_to_upload)
     else:
         print("No new documents to upload.")
 
+async def batch_upload_with_retry(client: SearchClient, docs: list,
+                                  batch_size: int = 200,
+                                  max_retries: int = 3,
+                                  backoff_factor: float = 2.0):
+    total = len(docs)
+    for i in range(0, total, batch_size):
+        batch = docs[i: i + batch_size]
+        attempt = 0
+        while attempt < max_retries:
+            try:
+                print(f"Uploading batch {i // batch_size + 1} (docs {i}–{i + len(batch) - 1}) try {attempt + 1}")
+                results = client.upload_documents(documents=batch)
+                success = sum(1 for r in results if getattr(r, "succeeded", False))
+                print(f"Batch upload success: {success}/{len(batch)}")
+                # Log failures
+                for r in results:
+                    if not getattr(r, "succeeded", False):
+                        print(f"  - Failed document key: {r.key}, error: {r.error_message}")
+                break  # exit retry loop on success
+            except (ServiceRequestError, HttpResponseError) as e:
+                attempt += 1
+                wait_time = backoff_factor ** attempt
+                print(f"Batch failed with {e.__class__.__name__}: {e}. Retrying in {wait_time:.1f}s...")
+                await sleep(wait_time)
+        else:
+            print(f"Batch starting at index {i} failed after {max_retries} attempts.")
+
 if __name__ == "__main__":
-    # IMPORTANT: Before running, ensure DOCUMENTS_DIR is set correctly.
     asyncio.run(ingest_data())

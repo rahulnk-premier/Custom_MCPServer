@@ -3,124 +3,106 @@
 import os
 import logging
 import asyncio
-from typing import List, Optional
+from typing import List
 import io
 import ssl
 import certifi
 
 import httpx
-from PIL import Image
-import torch
-from transformers import BlipProcessor, BlipForConditionalGeneration
 from bs4 import BeautifulSoup
+from dotenv import load_dotenv
+
+# NEW: Import Azure AI Vision SDK components
+from azure.core.credentials import AzureKeyCredential
+from azure.ai.vision.imageanalysis import ImageAnalysisClient
+from azure.ai.vision.imageanalysis.models import VisualFeatures
 
 # --- Setup ---
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+load_dotenv() # Load environment variables from .env file
 
-# --- SSL Configuration ---
-# Use the same certificate path you defined in mcp_app.py
-CERTIFICATE_PATH = r"C:\Users\Administrator\Downloads\trusted_certs.crt"
-
-def create_ssl_context():
-    """Create SSL context with corporate certificates"""
-    # Start with the default certs from certifi
-    context = ssl.create_default_context(cafile=certifi.where())
-    
-    # Add your corporate certificate if it exists
-    if os.path.exists(CERTIFICATE_PATH):
-        logger.info(f"Loading custom corporate certificate from: {CERTIFICATE_PATH}")
-        context.load_verify_locations(CERTIFICATE_PATH)
-    else:
-        logger.warning(f"Custom certificate file not found at: {CERTIFICATE_PATH}. Using default certs.")
-        
-    return context
+# NEW: Azure Computer Vision Configuration
+AZURE_VISION_ENDPOINT = os.getenv("AZURE_VISION_ENDPOINT")
+AZURE_VISION_KEY = os.getenv("AZURE_VISION_KEY")
 
 
-if os.path.exists(CERTIFICATE_PATH):
-    os.environ['REQUESTS_CA_BUNDLE'] = CERTIFICATE_PATH
 
-# --- Model Configuration ---
-MODEL_ID = "Salesforce/blip-image-captioning-base"
-MODEL_PATH = "./blip-model-offline" 
-
-# --- Global Model Cache ---
-PROCESSOR: Optional[BlipProcessor] = None
-MODEL: Optional[BlipForConditionalGeneration] = None
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-
-try:
-    logger.info(f"Loading vision model from local path '{MODEL_PATH}' onto device '{DEVICE}'...")
-    PROCESSOR = BlipProcessor.from_pretrained(MODEL_PATH)
-    MODEL = BlipForConditionalGeneration.from_pretrained(MODEL_PATH).to(DEVICE)
-    logger.info("Vision model loaded successfully from local files.")
-
-except Exception as e:
-    logger.error(f"FATAL: Failed to load the vision model from local path '{MODEL_PATH}'. Ensure the folder exists and contains all necessary files. Error: {e}", exc_info=True)
+# if os.path.exists(CERTIFICATE_PATH):
+#     os.environ['REQUESTS_CA_BUNDLE'] = CERTIFICATE_PATH
 
 
+
+# --- Helper Functions (Unchanged) ---
 def extract_image_urls(html_content: str) -> List[str]:
-    """
-    Parses an HTML string to find and extract all image URLs.
-    (This function does not need changes)
-    """
+    """Parses an HTML string to find and extract all image URLs."""
     if not html_content:
         return []
-    
     soup = BeautifulSoup(html_content, 'html.parser')
     img_tags = soup.find_all('img')
     urls = [img['src'] for img in img_tags if 'src' in img.attrs]
     logger.info(f"Found {len(urls)} image URL(s) in HTML content.")
     return urls
 
-async def _analyze_single_image(image_bytes: bytes, context_text: str) -> str:
+# --- REWRITTEN: Image Analysis function now uses Azure ---
+async def _analyze_single_image_with_azure(
+    vision_client: ImageAnalysisClient, 
+    image_bytes: bytes, 
+    context_text: str
+) -> str:
     """
-    Analyzes a single image using the pre-loaded BLIP model, guided by context.
-    (This function does not need changes)
+    Analyzes a single image using the Azure AI Vision service and frames it with context.
     """
-    if not MODEL or not PROCESSOR:
-        logger.warning("Vision model is not available. Skipping image analysis.")
-        return "Vision model is not loaded, analysis skipped."
-
     try:
-        raw_image = Image.open(io.BytesIO(image_bytes)).convert('RGB')
+        # The Azure Vision SDK's 'analyze' method is synchronous.
+        # We run it in a separate thread to avoid blocking the asyncio event loop.
+        def perform_azure_analysis():
+            result = vision_client.analyze(
+                image_data=image_bytes,
+                visual_features=[VisualFeatures.CAPTION]
+            )
+            
+            # If a caption is found, prepend our context to it.
+            if result.caption and result.caption.text:
+                # This is how we re-introduce the context to the final summary
+                return f"{context_text}: '{result.caption.text}'"
+            return "No caption could be generated for this image."
 
-        def perform_inference():
-            inputs = PROCESSOR(raw_image, context_text, return_tensors="pt").to(DEVICE)
-            output = MODEL.generate(**inputs)
-            caption = PROCESSOR.decode(output[0], skip_special_tokens=True)
-            return caption
-
-        caption = await asyncio.to_thread(perform_inference)
-        logger.info(f"Generated image caption: '{caption}'")
-        return caption.strip()
+        # Execute the synchronous SDK call in a non-blocking way
+        summary = await asyncio.to_thread(perform_azure_analysis)
+        logger.info(f"Successfully generated summary from Azure Vision.")
+        return summary
 
     except Exception as e:
-        logger.error(f"Error during image analysis: {e}", exc_info=True)
-        return "Failed to analyze image."
+        logger.error(f"Azure Vision API call failed: {e}", exc_info=True)
+        return "Failed to analyze image with Azure service."
 
-# --- Main Public Function (MODIFIED) ---
-
+# --- Main Public Function (MODIFIED to use Azure) ---
 async def generate_image_summaries_from_incident(
     html_description: str,
     incident_title: str,
     pat: str
 ) -> str:
     """
-    Orchestrates the process of extracting, downloading, and analyzing images
-    from an Azure DevOps incident description.
+    Orchestrates extracting, downloading, and analyzing images using Azure AI Vision.
     """
+    if not all([AZURE_VISION_ENDPOINT, AZURE_VISION_KEY]):
+        logger.error("Azure Vision endpoint or key is not configured. Skipping image analysis.")
+        return ""
+
     image_urls = extract_image_urls(html_description)
     if not image_urls:
         return ""
 
+    # NEW: Initialize the Azure Vision client once
+    vision_client = ImageAnalysisClient(
+        endpoint=AZURE_VISION_ENDPOINT,
+        credential=AzureKeyCredential(AZURE_VISION_KEY)
+    )
+
     summaries = []
-    
-    # *** MODIFICATION HERE ***
-    # Create the SSL context and pass it to the httpx client.
-    ssl_context = create_ssl_context()
-    
-    async with httpx.AsyncClient(auth=("", pat), verify=ssl_context) as client:
+        
+    async with httpx.AsyncClient(auth=("", pat)) as client:
         for i, url in enumerate(image_urls, 1):
             try:
                 logger.info(f"Downloading image from: {url}")
@@ -128,8 +110,10 @@ async def generate_image_summaries_from_incident(
                 response.raise_for_status()
                 
                 image_bytes = response.content
-                context = f"a screenshot of a software error related to: {incident_title}"
-                summary = await _analyze_single_image(image_bytes, context)
+                context = f"A screenshot of a software error related to '{incident_title}'"
+                
+                # CHANGED: Call the new Azure-based analysis function
+                summary = await _analyze_single_image_with_azure(vision_client, image_bytes, context)
                 
                 summaries.append(f"Image {i} Analysis: {summary}")
 
